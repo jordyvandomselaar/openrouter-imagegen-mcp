@@ -218,10 +218,11 @@ IMPORTANT: After this tool completes, you MUST call handle_generated_image with 
 Do NOT use this tool to edit existing images - use edit_image instead.`,
   {
     prompt: z.string().describe("A full description of the image to generate. Be detailed about the scene, style, colors, composition, etc."),
+    resolution: z.enum(["1K", "2K", "4K"]).optional().describe("Image resolution. Defaults to 1K. Only use 4K if the user explicitly requests high resolution."),
   },
-  async ({ prompt }) => {
+  async ({ prompt, resolution }) => {
     const apiKey = getApiKey();
-    const selectedModel = "google/gemini-2.5-flash-image-preview";
+    const selectedModel = "google/gemini-3-pro-image-preview";
     const conversation_id = undefined; // New conversation
 
     // Get or create conversation
@@ -247,6 +248,9 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
         model: selectedModel,
         messages: messagesToApiFormat(messages),
         modalities: ["image", "text"],
+        image_config: {
+          image_size: resolution || "1K",
+        },
       };
 
       // Use fetch directly to avoid SDK stripping image data
@@ -511,10 +515,11 @@ Good prompts:
   {
     conversation_id: z.string().describe("The conversation ID from a previous generate_image or edit_image call"),
     prompt: z.string().describe("Describe what to CHANGE about the image. E.g., 'make the background blue', 'add a rainbow', 'remove the person on the left'"),
+    resolution: z.enum(["1K", "2K", "4K"]).optional().describe("Image resolution. Defaults to 1K. Only use 4K if the user explicitly requests high resolution."),
   },
-  async ({ conversation_id, prompt }) => {
+  async ({ conversation_id, prompt, resolution }) => {
     const apiKey = getApiKey();
-    const selectedModel = "google/gemini-2.5-flash-image-preview";
+    const selectedModel = "google/gemini-3-pro-image-preview";
 
     // Get existing conversation
     let messages = conversations.get(conversation_id);
@@ -600,6 +605,9 @@ Only make the specific change requested above. The output should be identical to
           }
         ],
         modalities: ["image", "text"],
+        image_config: {
+          image_size: resolution || "1K",
+        },
       };
 
       const responseContent: Array<{ type: "text"; text: string }> = [];
