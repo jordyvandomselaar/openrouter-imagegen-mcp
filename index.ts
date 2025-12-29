@@ -567,16 +567,25 @@ Good prompts:
       }
     }
 
-    // Add the edit instruction
+    // Add the edit instruction - be very explicit about preserving everything else
     editContent.push({
       type: "text",
-      text: `Edit this image: ${prompt}`,
+      text: `Edit this image with ONLY this change: ${prompt}
+
+CRITICAL: You must keep EVERYTHING else in the image EXACTLY the same. Do not change:
+- The composition or layout
+- The background
+- Any other objects or elements
+- The style or lighting
+- Colors of anything not explicitly mentioned
+
+Only make the specific change requested above. The output should be identical to the input except for that one change.`,
     });
 
-    // Add user edit message with image inline
+    // Add user edit message to conversation history
     messages.push({
       role: "user",
-      content: `Look at the image I sent above. Edit that specific image to make this change: ${prompt}. Keep everything else in the image the same.`,
+      content: `Edit request: ${prompt}`,
     });
 
     try {
