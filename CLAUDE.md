@@ -31,9 +31,27 @@ Add to your Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json`
 }
 ```
 
+## S3 Image Hosting (for server deployments)
+
+For hosting on Coolify or similar, configure S3-compatible storage:
+
+```sh
+S3_ENDPOINT=https://minio.example.com
+S3_BUCKET=imagegen
+S3_ACCESS_KEY_ID=your-key
+S3_SECRET_ACCESS_KEY=your-secret
+S3_PUBLIC_URL_BASE=https://minio.example.com/imagegen
+S3_REGION=auto        # optional
+S3_PREFIX=images      # optional
+```
+
+When S3 is configured, images are uploaded and URLs are returned instead of local paths.
+
 ## Tools
 
-- `generate_image` - Generate images from text prompts. Supports iterative refinement via conversation IDs.
+- `generate_image` - Generate images from text prompts. Returns IMAGE_URL (S3) or IMAGE_PATH (local).
+- `edit_image` - Edit existing images with natural language instructions.
+- `handle_generated_image` - Process generated images (share URL or open locally).
 - `list_conversations` - List active image generation conversations
 - `clear_conversation` - Clear conversation history
 

@@ -5,6 +5,7 @@ import { z } from "zod";
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 // Create images folder in the MCP directory
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -13,6 +14,92 @@ try {
   mkdirSync(IMAGE_DIR, { recursive: true });
 } catch {}
 console.error(`Image output directory: ${IMAGE_DIR}`);
+
+// S3 Configuration for image hosting
+interface S3Config {
+  enabled: boolean;
+  client: S3Client | null;
+  bucket: string;
+  publicUrlBase: string;
+  prefix: string;
+}
+
+function initS3Config(): S3Config {
+  const endpoint = process.env.S3_ENDPOINT;
+  const bucket = process.env.S3_BUCKET;
+  const accessKeyId = process.env.S3_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
+  const publicUrlBase = process.env.S3_PUBLIC_URL_BASE;
+  const region = process.env.S3_REGION || "auto";
+  const prefix = process.env.S3_PREFIX || "images";
+
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey || !publicUrlBase) {
+    console.error("S3 not configured - images will be stored locally only");
+    console.error("To enable S3, set: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_PUBLIC_URL_BASE");
+    return {
+      enabled: false,
+      client: null,
+      bucket: "",
+      publicUrlBase: "",
+      prefix: "",
+    };
+  }
+
+  const client = new S3Client({
+    endpoint,
+    region,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+    forcePathStyle: true, // Required for most S3-compatible services like MinIO
+  });
+
+  console.error(`S3 configured: ${endpoint} / ${bucket} (prefix: ${prefix})`);
+  console.error(`Public URL base: ${publicUrlBase}`);
+
+  return {
+    enabled: true,
+    client,
+    bucket,
+    publicUrlBase: publicUrlBase.replace(/\/$/, ""), // Remove trailing slash
+    prefix,
+  };
+}
+
+const s3Config = initS3Config();
+
+// Upload image to S3 and return public URL
+async function uploadToS3(
+  imageBuffer: Buffer,
+  filename: string,
+  mimeType: string,
+  conversationId: string
+): Promise<string | null> {
+  if (!s3Config.enabled || !s3Config.client) {
+    return null;
+  }
+
+  const key = `${s3Config.prefix}/${conversationId}/${filename}`;
+
+  try {
+    await s3Config.client.send(
+      new PutObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: key,
+        Body: imageBuffer,
+        ContentType: mimeType,
+      })
+    );
+
+    const publicUrl = `${s3Config.publicUrlBase}/${key}`;
+    console.error(`Uploaded to S3: ${publicUrl}`);
+    return publicUrl;
+  } catch (error) {
+    console.error(`S3 upload failed: ${error}`);
+    return null;
+  }
+}
 
 // Store conversation history for iterative image generation
 interface ConversationMessage {
@@ -213,7 +300,7 @@ server.tool(
   "generate_image",
   `Generate a NEW image from a text prompt. Use this for creating the first image in a conversation.
 
-IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned image_path and conversation_id.
+IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned IMAGE_URL (if S3 configured) or IMAGE_PATH, along with the conversation_id.
 
 Do NOT use this tool to edit existing images - use edit_image instead.`,
   {
@@ -440,15 +527,29 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
 
             // If we saved the image, add it to the response and conversation history
             if (savedFilepath) {
-              // Only return the file path - no base64 in response
-              responseContent.push({
-                type: "text",
-                text: `IMAGE_PATH: ${savedFilepath}`,
-              });
-
-              // Store file path (not base64) in conversation history for smaller JSON
               // Use relative path from IMAGE_DIR for portability
               const relativePath = savedFilepath.replace(IMAGE_DIR + (process.platform === "win32" ? "\\" : "/"), "");
+              const filename = relativePath.split(/[/\\]/).pop() || `${Date.now()}.png`;
+
+              // Try to upload to S3
+              const imageBuffer = readFileSync(savedFilepath);
+              const s3Url = await uploadToS3(imageBuffer, filename, imageMimeType, convId);
+
+              if (s3Url) {
+                // Return the S3 URL
+                responseContent.push({
+                  type: "text",
+                  text: `IMAGE_URL: ${s3Url}`,
+                });
+              } else {
+                // Fall back to local file path
+                responseContent.push({
+                  type: "text",
+                  text: `IMAGE_PATH: ${savedFilepath}`,
+                });
+              }
+
+              // Store file path in conversation history for smaller JSON
               assistantContent.push({
                 type: "image_url",
                 image_path: relativePath,
@@ -504,7 +605,7 @@ server.tool(
   "edit_image",
   `Request a new version of an image with changes. The model receives the previous image as context.
 
-IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned image_path and conversation_id.
+IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned IMAGE_URL (if S3 configured) or IMAGE_PATH, along with the conversation_id.
 
 NOTE: The model generates a new image inspired by your description and the previous image. Results may vary - some edits work well, others may produce a different image. For best results, be specific about what to keep and what to change.
 
@@ -743,13 +844,14 @@ Only make the specific change requested above. The output should be identical to
 
           if (imageUrl) {
             let savedFilepath: string | null = null;
+            let imageMimeType = "image/png";
 
             if (imageUrl.startsWith("data:")) {
               const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
               if (match) {
-                const mimeType = match[1];
+                imageMimeType = match[1];
                 const base64Data = match[2];
-                const extension = mimeType.split("/")[1] || "png";
+                const extension = imageMimeType.split("/")[1] || "png";
                 const filename = `${Date.now()}.${extension}`;
                 savedFilepath = join(convDir, filename);
 
@@ -761,8 +863,8 @@ Only make the specific change requested above. The output should be identical to
               try {
                 const fetchResp = await fetch(imageUrl);
                 const buffer = await fetchResp.arrayBuffer();
-                const contentType = fetchResp.headers.get("content-type") || "image/png";
-                const extension = contentType.split("/")[1] || "png";
+                imageMimeType = fetchResp.headers.get("content-type") || "image/png";
+                const extension = imageMimeType.split("/")[1] || "png";
                 const filename = `${Date.now()}.${extension}`;
                 savedFilepath = join(convDir, filename);
 
@@ -775,12 +877,29 @@ Only make the specific change requested above. The output should be identical to
             }
 
             if (savedFilepath) {
-              responseContent.push({
-                type: "text",
-                text: `IMAGE_PATH: ${savedFilepath}`,
-              });
-
+              // Use relative path from IMAGE_DIR for portability
               const relativePath = savedFilepath.replace(IMAGE_DIR + (process.platform === "win32" ? "\\" : "/"), "");
+              const filename = relativePath.split(/[/\\]/).pop() || `${Date.now()}.png`;
+
+              // Try to upload to S3
+              const imageBuffer = readFileSync(savedFilepath);
+              const s3Url = await uploadToS3(imageBuffer, filename, imageMimeType, convId);
+
+              if (s3Url) {
+                // Return the S3 URL
+                responseContent.push({
+                  type: "text",
+                  text: `IMAGE_URL: ${s3Url}`,
+                });
+              } else {
+                // Fall back to local file path
+                responseContent.push({
+                  type: "text",
+                  text: `IMAGE_PATH: ${savedFilepath}`,
+                });
+              }
+
+              // Store file path in conversation history for smaller JSON
               assistantContent.push({
                 type: "image_url",
                 image_path: relativePath,
@@ -833,17 +952,34 @@ server.tool(
   `Process a generated image. This tool MUST be called after generate_image or edit_image completes.
 
 Instructions for the assistant:
-1. Open the image using the system viewer so the user can see it
-2. Ask the user if they would like to make any changes to the image
-3. If the user wants changes, use edit_image with the conversation_id to iterate`,
+1. If S3 is configured, the image URL was returned - share it with the user
+2. If running locally, open the image using the system viewer
+3. Ask the user if they would like to make any changes to the image
+4. If the user wants changes, use edit_image with the conversation_id to iterate`,
   {
-    image_path: z.string().describe("The full path to the generated image file"),
+    image_path_or_url: z.string().describe("The image URL (if S3 configured) or local file path"),
     conversation_id: z.string().describe("The conversation ID for this image generation session"),
   },
-  async ({ image_path, conversation_id }) => {
-    if (!existsSync(image_path)) {
+  async ({ image_path_or_url, conversation_id }) => {
+    // Check if it's a URL (S3 mode) or local path
+    const isUrl = image_path_or_url.startsWith("http://") || image_path_or_url.startsWith("https://");
+
+    if (isUrl) {
+      // S3 mode - just return the URL for the user to view
       return {
-        content: [{ type: "text", text: `File not found: ${image_path}` }],
+        content: [
+          {
+            type: "text",
+            text: `Image available at: ${image_path_or_url}\n\nConversation ID: ${conversation_id}\n\nShare this URL with the user. Ask if they'd like to make any changes to the image. If yes, use edit_image with this conversation_id to iterate.`,
+          },
+        ],
+      };
+    }
+
+    // Local mode - try to open the image
+    if (!existsSync(image_path_or_url)) {
+      return {
+        content: [{ type: "text", text: `File not found: ${image_path_or_url}` }],
         isError: true,
       };
     }
@@ -852,10 +988,10 @@ Instructions for the assistant:
       // Open with default app based on platform
       const { exec } = await import("child_process");
       const command = process.platform === "win32"
-        ? `start "" "${image_path}"`
+        ? `start "" "${image_path_or_url}"`
         : process.platform === "darwin"
-        ? `open "${image_path}"`
-        : `xdg-open "${image_path}"`;
+        ? `open "${image_path_or_url}"`
+        : `xdg-open "${image_path_or_url}"`;
 
       exec(command, (error) => {
         if (error) {
@@ -867,7 +1003,7 @@ Instructions for the assistant:
         content: [
           {
             type: "text",
-            text: `Image opened: ${image_path}\n\nConversation ID: ${conversation_id}\n\nAsk the user if they'd like to make any changes to the image. If yes, use edit_image with this conversation_id to iterate.`,
+            text: `Image opened: ${image_path_or_url}\n\nConversation ID: ${conversation_id}\n\nAsk the user if they'd like to make any changes to the image. If yes, use edit_image with this conversation_id to iterate.`,
           },
         ],
       };
