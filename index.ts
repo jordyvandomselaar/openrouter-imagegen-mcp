@@ -2,75 +2,207 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 
-// Create images folder in the MCP directory
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const IMAGE_DIR = join(__dirname, "images");
-try {
-  mkdirSync(IMAGE_DIR, { recursive: true });
-} catch {}
-console.error(`Image output directory: ${IMAGE_DIR}`);
+// S3 Configuration (required)
+interface S3Config {
+  client: S3Client;
+  bucket: string;
+  publicUrlBase: string;
+  prefix: string;
+}
+
+function initS3Config(): S3Config {
+  const endpoint = process.env.S3_ENDPOINT;
+  const bucket = process.env.S3_BUCKET;
+  const accessKeyId = process.env.S3_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
+  const publicUrlBase = process.env.S3_PUBLIC_URL_BASE;
+  const region = process.env.S3_REGION || "auto";
+  const prefix = process.env.S3_PREFIX || "images";
+
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey || !publicUrlBase) {
+    throw new Error(
+      "S3 configuration is required. Set these environment variables:\n" +
+      "  S3_ENDPOINT - S3-compatible endpoint URL\n" +
+      "  S3_BUCKET - Bucket name\n" +
+      "  S3_ACCESS_KEY_ID - Access key\n" +
+      "  S3_SECRET_ACCESS_KEY - Secret key\n" +
+      "  S3_PUBLIC_URL_BASE - Public URL base for accessing images"
+    );
+  }
+
+  const client = new S3Client({
+    endpoint,
+    region,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+    forcePathStyle: true, // Required for most S3-compatible services like MinIO
+  });
+
+  console.error(`S3 configured: ${endpoint} / ${bucket} (prefix: ${prefix})`);
+  console.error(`Public URL base: ${publicUrlBase}`);
+
+  return {
+    client,
+    bucket,
+    publicUrlBase: publicUrlBase.replace(/\/$/, ""), // Remove trailing slash
+    prefix,
+  };
+}
+
+const s3Config = initS3Config();
+
+// Upload image to S3 and return public URL
+async function uploadImageToS3(
+  imageBuffer: Buffer,
+  filename: string,
+  mimeType: string,
+  conversationId: string
+): Promise<string> {
+  const key = `${s3Config.prefix}/${conversationId}/${filename}`;
+
+  await s3Config.client.send(
+    new PutObjectCommand({
+      Bucket: s3Config.bucket,
+      Key: key,
+      Body: imageBuffer,
+      ContentType: mimeType,
+    })
+  );
+
+  const publicUrl = `${s3Config.publicUrlBase}/${key}`;
+  console.error(`Uploaded to S3: ${publicUrl}`);
+  return publicUrl;
+}
+
+// Upload JSON data to S3
+async function uploadJsonToS3(key: string, data: any): Promise<void> {
+  await s3Config.client.send(
+    new PutObjectCommand({
+      Bucket: s3Config.bucket,
+      Key: key,
+      Body: JSON.stringify(data, null, 2),
+      ContentType: "application/json",
+    })
+  );
+}
+
+// Download JSON data from S3
+async function downloadJsonFromS3<T>(key: string): Promise<T | null> {
+  try {
+    const response = await s3Config.client.send(
+      new GetObjectCommand({
+        Bucket: s3Config.bucket,
+        Key: key,
+      })
+    );
+    const body = await response.Body?.transformToString();
+    return body ? JSON.parse(body) : null;
+  } catch (error: any) {
+    if (error.name === "NoSuchKey") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+// List objects under a prefix in S3
+async function listS3Prefix(prefix: string): Promise<string[]> {
+  const keys: string[] = [];
+  let continuationToken: string | undefined;
+
+  do {
+    const response = await s3Config.client.send(
+      new ListObjectsV2Command({
+        Bucket: s3Config.bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      })
+    );
+
+    for (const obj of response.Contents || []) {
+      if (obj.Key) {
+        keys.push(obj.Key);
+      }
+    }
+
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+
+  return keys;
+}
+
+// Delete all objects under a prefix in S3
+async function deleteS3Prefix(prefix: string): Promise<number> {
+  const keys = await listS3Prefix(prefix);
+  if (keys.length === 0) return 0;
+
+  // Delete in batches of 1000 (S3 limit)
+  for (let i = 0; i < keys.length; i += 1000) {
+    const batch = keys.slice(i, i + 1000);
+    await s3Config.client.send(
+      new DeleteObjectsCommand({
+        Bucket: s3Config.bucket,
+        Delete: {
+          Objects: batch.map(key => ({ Key: key })),
+        },
+      })
+    );
+  }
+
+  return keys.length;
+}
 
 // Store conversation history for iterative image generation
 interface ConversationMessage {
   role: "user" | "assistant";
-  content: string | Array<{ type: string; text?: string; image_url?: { url: string }; image_path?: string }>;
+  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+}
+
+interface ConversationMetadata {
+  id: string;
+  firstPrompt: string;
+  messageCount: number;
+  imageCount: number;
 }
 
 const conversations = new Map<string, ConversationMessage[]>();
 
-// Load existing conversations from disk on startup
-function loadConversationsFromDisk() {
+// Load existing conversations from S3 on startup
+async function loadConversationsFromS3(): Promise<void> {
   try {
-    const dirs = readdirSync(IMAGE_DIR, { withFileTypes: true });
-    for (const dir of dirs) {
-      if (dir.isDirectory()) {
-        const convId = dir.name;
-        const messagesPath = join(IMAGE_DIR, convId, "messages.json");
-        if (existsSync(messagesPath)) {
-          const data = readFileSync(messagesPath, "utf-8");
-          conversations.set(convId, JSON.parse(data));
-          console.error(`Loaded conversation: ${convId}`);
-        }
+    const prefix = `${s3Config.prefix}/`;
+    const keys = await listS3Prefix(prefix);
+
+    // Find all messages.json files
+    const messageKeys = keys.filter(k => k.endsWith("/messages.json"));
+
+    for (const key of messageKeys) {
+      // Extract conversation ID from key: {prefix}/{convId}/messages.json
+      const parts = key.split("/");
+      const convId = parts[parts.length - 2] || "";
+      if (!convId) continue;
+
+      const messages = await downloadJsonFromS3<ConversationMessage[]>(key);
+      if (messages) {
+        conversations.set(convId, messages);
+        console.error(`Loaded conversation: ${convId}`);
       }
     }
-    console.error(`Loaded ${conversations.size} conversations from disk`);
+
+    console.error(`Loaded ${conversations.size} conversations from S3`);
   } catch (err) {
-    console.error(`Error loading conversations: ${err}`);
+    console.error(`Error loading conversations from S3: ${err}`);
   }
 }
 
-// Save conversation to disk
-function saveConversationToDisk(convId: string, messages: ConversationMessage[], firstPrompt: string) {
-  const convDir = join(IMAGE_DIR, convId);
-  try {
-    mkdirSync(convDir, { recursive: true });
-  } catch {}
-
-  // Save messages as JSON
-  writeFileSync(join(convDir, "messages.json"), JSON.stringify(messages, null, 2));
-
-  // Create/update README.md with description
-  const readmePath = join(convDir, "README.md");
-  const imageFiles = readdirSync(convDir).filter(f => /\.(png|jpg|jpeg|gif|webp)$/i.test(f));
-
-  let readme = `# Image Generation Conversation\n\n`;
-  readme += `**ID:** ${convId}\n\n`;
-  readme += `**Initial Prompt:** ${firstPrompt}\n\n`;
-  readme += `**Messages:** ${messages.length}\n\n`;
-  readme += `**Images:** ${imageFiles.length}\n\n`;
-
-  if (imageFiles.length > 0) {
-    readme += `## Generated Images\n\n`;
-    for (const img of imageFiles) {
-      readme += `![${img}](./${img})\n\n`;
-    }
-  }
-
-  writeFileSync(readmePath, readme);
+// Save conversation to S3
+async function saveConversationToS3(convId: string, messages: ConversationMessage[]): Promise<void> {
+  const key = `${s3Config.prefix}/${convId}/messages.json`;
+  await uploadJsonToS3(key, messages);
 }
 
 // Get first user prompt from messages
@@ -82,112 +214,43 @@ function getFirstPrompt(messages: ConversationMessage[]): string {
     : "Image conversation";
 }
 
-// Convert stored messages to API format (read images from disk)
-function messagesToApiFormat(messages: ConversationMessage[]): Array<{ role: string; content: any }> {
-  return messages.map(m => {
+// Convert stored messages to API format (fetch images from S3 URLs and convert to base64)
+async function messagesToApiFormat(messages: ConversationMessage[]): Promise<Array<{ role: string; content: any }>> {
+  const result: Array<{ role: string; content: any }> = [];
+
+  for (const m of messages) {
     if (typeof m.content === "string") {
-      return { role: m.role, content: m.content };
+      result.push({ role: m.role, content: m.content });
+      continue;
     }
 
-    // Convert content array, reading images from disk
+    // Convert content array, fetching images from S3 URLs
     const apiContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
 
     for (const item of m.content) {
       if (item.type === "text" && item.text) {
         apiContent.push({ type: "text", text: item.text });
-      } else if (item.type === "image_url" && (item as any).image_path) {
-        // Read image from disk and convert to base64
-        const imagePath = join(IMAGE_DIR, (item as any).image_path);
-        try {
-          if (existsSync(imagePath)) {
-            const imageBuffer = readFileSync(imagePath);
-            const base64 = imageBuffer.toString("base64");
-            const ext = imagePath.split(".").pop()?.toLowerCase() || "png";
-            const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
-            apiContent.push({
-              type: "image_url",
-              image_url: { url: `data:${mimeType};base64,${base64}` }
-            });
-          } else {
-            console.error(`Image file not found: ${imagePath}`);
-          }
-        } catch (err) {
-          console.error(`Error reading image: ${err}`);
-        }
       } else if (item.type === "image_url" && item.image_url?.url) {
-        // Legacy: already has a URL (for backwards compatibility)
-        apiContent.push({ type: "image_url", image_url: item.image_url });
+        // Fetch image from URL and convert to base64
+        try {
+          const response = await fetch(item.image_url.url);
+          const buffer = await response.arrayBuffer();
+          const base64 = Buffer.from(buffer).toString("base64");
+          const contentType = response.headers.get("content-type") || "image/png";
+          apiContent.push({
+            type: "image_url",
+            image_url: { url: `data:${contentType};base64,${base64}` }
+          });
+        } catch (err) {
+          console.error(`Error fetching image from ${item.image_url.url}: ${err}`);
+        }
       }
     }
 
-    return { role: m.role, content: apiContent.length > 0 ? apiContent : "" };
-  });
-}
-
-// Log API request to conversation folder (omit API key, truncate base64)
-function logApiRequest(convDir: string, requestBody: any, response: any) {
-  try {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logPath = join(convDir, `request-${timestamp}.json`);
-
-    // Sanitize request: truncate base64 data for readability
-    const sanitizeContent = (content: any): any => {
-      if (typeof content === 'string') {
-        if (content.length > 500 && content.includes('base64')) {
-          return content.substring(0, 100) + `... [TRUNCATED ${content.length} chars]`;
-        }
-        return content;
-      }
-      if (Array.isArray(content)) {
-        return content.map(sanitizeContent);
-      }
-      if (content && typeof content === 'object') {
-        const sanitized: any = {};
-        for (const key of Object.keys(content)) {
-          if (key === 'image_url' && content[key]?.url?.length > 500) {
-            sanitized[key] = { url: `[BASE64 IMAGE - ${content[key].url.length} chars]` };
-          } else {
-            sanitized[key] = sanitizeContent(content[key]);
-          }
-        }
-        return sanitized;
-      }
-      return content;
-    };
-
-    const logData = {
-      timestamp: new Date().toISOString(),
-      request: {
-        model: requestBody.model,
-        modalities: requestBody.modalities,
-        messages: requestBody.messages.map((m: any) => ({
-          role: m.role,
-          content: sanitizeContent(m.content),
-        })),
-      },
-      response: {
-        id: response.id,
-        model: response.model,
-        provider: response.provider,
-        usage: response.usage,
-        choices: response.choices?.map((c: any) => ({
-          finish_reason: c.finish_reason,
-          message: {
-            role: c.message?.role,
-            content: sanitizeContent(c.message?.content),
-            // Note if images were present
-            has_images: !!(c.message?.images?.length),
-            image_count: c.message?.images?.length || 0,
-          },
-        })),
-      },
-    };
-
-    writeFileSync(logPath, JSON.stringify(logData, null, 2));
-    console.error(`Logged API request to: ${logPath}`);
-  } catch (err) {
-    console.error(`Failed to log API request: ${err}`);
+    result.push({ role: m.role, content: apiContent.length > 0 ? apiContent : "" });
   }
+
+  return result;
 }
 
 // Get API key
@@ -213,7 +276,7 @@ server.tool(
   "generate_image",
   `Generate a NEW image from a text prompt. Use this for creating the first image in a conversation.
 
-IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned image_path and conversation_id.
+IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned IMAGE_URL, along with the conversation_id.
 
 Do NOT use this tool to edit existing images - use edit_image instead.`,
   {
@@ -223,18 +286,10 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
   async ({ prompt, resolution }) => {
     const apiKey = getApiKey();
     const selectedModel = "google/gemini-3-pro-image-preview";
-    const conversation_id = undefined; // New conversation
 
-    // Get or create conversation
-    const convId = conversation_id || crypto.randomUUID();
-    let messages = conversations.get(convId) || [];
-    const isNewConversation = messages.length === 0;
-
-    // Create conversation directory
-    const convDir = join(IMAGE_DIR, convId);
-    try {
-      mkdirSync(convDir, { recursive: true });
-    } catch {}
+    // Create new conversation
+    const convId = crypto.randomUUID();
+    let messages: ConversationMessage[] = [];
 
     // Add user message
     messages.push({
@@ -246,7 +301,7 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
       // Build request body
       const requestBody = {
         model: selectedModel,
-        messages: messagesToApiFormat(messages),
+        messages: await messagesToApiFormat(messages),
         modalities: ["image", "text"],
         image_config: {
           image_size: resolution || "1K",
@@ -268,10 +323,7 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
         throw new Error(`API error: ${response.status} ${errorText}`);
       }
 
-      const result = await response.json();
-
-      // Log request and response to conversation folder
-      logApiRequest(convDir, requestBody, result);
+      const result: any = await response.json();
 
       const assistantMessage = result.choices[0]?.message;
       if (!assistantMessage) {
@@ -279,7 +331,7 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
       }
 
       // Build response content
-      const responseContent: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+      const responseContent: Array<{ type: "text"; text: string }> = [];
 
       // Add text response if present (filter out <image> placeholder)
       const rawTextContent = assistantMessage.content;
@@ -378,82 +430,48 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
           console.error(`Image object sample: ${JSON.stringify(image).substring(0, 200)}`);
 
           // Try multiple formats: OpenRouter, OpenAI, Gemini, etc.
-          let imageUrl: string | null = null;
+          let imageData: { buffer: Buffer; mimeType: string } | null = null;
 
           // Format 1: imageUrl.url (OpenRouter SDK style)
-          if (image.imageUrl?.url) imageUrl = image.imageUrl.url;
+          if (image.imageUrl?.url) {
+            imageData = await fetchImageAsBuffer(image.imageUrl.url);
+          }
           // Format 2: image_url.url (OpenAI style)
-          else if (image.image_url?.url) imageUrl = image.image_url.url;
+          else if (image.image_url?.url) {
+            imageData = await fetchImageAsBuffer(image.image_url.url);
+          }
           // Format 3: direct url
-          else if (image.url) imageUrl = image.url;
+          else if (image.url) {
+            imageData = await fetchImageAsBuffer(image.url);
+          }
           // Format 4: base64 data directly on object
           else if (image.data && typeof image.data === 'string') {
             const mimeType = image.mimeType || image.mime_type || 'image/png';
-            imageUrl = `data:${mimeType};base64,${image.data}`;
+            imageData = { buffer: Buffer.from(image.data, 'base64'), mimeType };
           }
           // Format 5: b64_json (OpenAI DALL-E style)
           else if (image.b64_json) {
-            imageUrl = `data:image/png;base64,${image.b64_json}`;
+            imageData = { buffer: Buffer.from(image.b64_json, 'base64'), mimeType: 'image/png' };
           }
 
-          console.error(`Processing image: ${imageUrl ? imageUrl.substring(0, 100) + '...' : 'no url found'}`);
-          if (imageUrl) {
-            let savedFilepath: string | null = null;
-            let imageBase64: string | null = null;
-            let imageMimeType = "image/png";
+          if (imageData) {
+            const extension = imageData.mimeType.split("/")[1] || "png";
+            const filename = `${Date.now()}.${extension}`;
 
-            // Handle base64 data URLs
-            if (imageUrl.startsWith("data:")) {
-              const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
-              if (match) {
-                imageMimeType = match[1];
-                imageBase64 = match[2];
-                const extension = imageMimeType.split("/")[1] || "png";
-                const filename = `${Date.now()}.${extension}`;
-                savedFilepath = join(convDir, filename);
+            // Upload directly to S3
+            const s3Url = await uploadImageToS3(imageData.buffer, filename, imageData.mimeType, convId);
+            console.error(`Uploaded image to S3: ${s3Url} (${(imageData.buffer.length / 1024).toFixed(1)}KB)`);
 
-                // Save image to conversation folder
-                const imageBuffer = Buffer.from(imageBase64, "base64");
-                writeFileSync(savedFilepath, imageBuffer);
-                console.error(`Saved image: ${savedFilepath} (${(imageBuffer.length / 1024).toFixed(1)}KB)`);
-              }
-            } else {
-              // For regular URLs, fetch and save to file
-              try {
-                const fetchResp = await fetch(imageUrl);
-                const buffer = await fetchResp.arrayBuffer();
-                const contentType = fetchResp.headers.get("content-type") || "image/png";
-                imageMimeType = contentType;
-                const extension = contentType.split("/")[1] || "png";
-                const filename = `${Date.now()}.${extension}`;
-                savedFilepath = join(convDir, filename);
+            responseContent.push({
+              type: "text",
+              text: `IMAGE_URL: ${s3Url}`,
+            });
 
-                // Save image to conversation folder
-                const imageBuffer = Buffer.from(buffer);
-                writeFileSync(savedFilepath, imageBuffer);
-                imageBase64 = imageBuffer.toString("base64");
-                console.error(`Saved image: ${savedFilepath} (${(buffer.byteLength / 1024).toFixed(1)}KB)`);
-              } catch (fetchError) {
-                console.error(`Failed to fetch image: ${fetchError}`);
-              }
-            }
-
-            // If we saved the image, add it to the response and conversation history
-            if (savedFilepath) {
-              // Only return the file path - no base64 in response
-              responseContent.push({
-                type: "text",
-                text: `IMAGE_PATH: ${savedFilepath}`,
-              });
-
-              // Store file path (not base64) in conversation history for smaller JSON
-              // Use relative path from IMAGE_DIR for portability
-              const relativePath = savedFilepath.replace(IMAGE_DIR + (process.platform === "win32" ? "\\" : "/"), "");
-              assistantContent.push({
-                type: "image_url",
-                image_path: relativePath,
-              } as any);
-            }
+            // Store S3 URL in conversation history
+            assistantContent.push({
+              type: "image_url",
+              image_url: { url: s3Url },
+            });
           }
         }
 
@@ -471,9 +489,9 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
         });
       }
 
-      // Save conversation to memory and disk
+      // Save conversation to memory and S3
       conversations.set(convId, messages);
-      saveConversationToDisk(convId, messages, getFirstPrompt(messages));
+      await saveConversationToS3(convId, messages);
 
       // Add conversation ID info
       responseContent.push({
@@ -499,12 +517,32 @@ Do NOT use this tool to edit existing images - use edit_image instead.`,
   }
 );
 
+// Helper to fetch image from URL and return as buffer
+async function fetchImageAsBuffer(url: string): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  try {
+    if (url.startsWith("data:")) {
+      const match = url.match(/^data:([^;]+);base64,(.+)$/);
+      if (match && match[1] && match[2]) {
+        return { buffer: Buffer.from(match[2], 'base64'), mimeType: match[1] };
+      }
+      return null;
+    }
+    const response = await fetch(url);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const mimeType = response.headers.get("content-type") || "image/png";
+    return { buffer, mimeType };
+  } catch (error) {
+    console.error(`Failed to fetch image from ${url}: ${error}`);
+    return null;
+  }
+}
+
 // Tool: Edit image (iterate on existing images)
 server.tool(
   "edit_image",
   `Request a new version of an image with changes. The model receives the previous image as context.
 
-IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned image_path and conversation_id.
+IMPORTANT: After this tool completes, you MUST call handle_generated_image with the returned IMAGE_URL, along with the conversation_id.
 
 NOTE: The model generates a new image inspired by your description and the previous image. Results may vary - some edits work well, others may produce a different image. For best results, be specific about what to keep and what to change.
 
@@ -536,38 +574,33 @@ Good prompts:
     }
 
     const convId = conversation_id;
-    const convDir = join(IMAGE_DIR, convId);
 
-    // Find the most recent image from conversation history
-    let lastImagePath: string | null = null;
+    // Find the most recent image URL from conversation history
+    let lastImageUrl: string | null = null;
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
+      const msg = messages[i]!;
       if (Array.isArray(msg.content)) {
         for (const item of msg.content) {
-          if ((item as any).image_path) {
-            lastImagePath = (item as any).image_path;
+          if (item.type === "image_url" && item.image_url?.url) {
+            lastImageUrl = item.image_url.url;
             break;
           }
         }
-        if (lastImagePath) break;
+        if (lastImageUrl) break;
       }
     }
 
     // Build the edit request with image inline in the user message
-    // This may work better than relying on conversation history
     const editContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
 
-    // Add the previous image inline
-    if (lastImagePath) {
-      const imagePath = join(IMAGE_DIR, lastImagePath);
-      if (existsSync(imagePath)) {
-        const imageBuffer = readFileSync(imagePath);
-        const base64 = imageBuffer.toString("base64");
-        const ext = imagePath.split(".").pop()?.toLowerCase() || "png";
-        const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
+    // Add the previous image inline (fetch from S3 and convert to base64)
+    if (lastImageUrl) {
+      const imageData = await fetchImageAsBuffer(lastImageUrl);
+      if (imageData) {
+        const base64 = imageData.buffer.toString("base64");
         editContent.push({
           type: "image_url",
-          image_url: { url: `data:${mimeType};base64,${base64}` }
+          image_url: { url: `data:${imageData.mimeType};base64,${base64}` }
         });
       }
     }
@@ -595,7 +628,6 @@ Only make the specific change requested above. The output should be identical to
 
     try {
       // Build request body - send just the edit request with image inline
-      // instead of full conversation history
       const requestBody = {
         model: selectedModel,
         messages: [
@@ -627,10 +659,7 @@ Only make the specific change requested above. The output should be identical to
         throw new Error(`API error: ${response.status} ${errorText}`);
       }
 
-      const result = await response.json();
-
-      // Log request and response to conversation folder
-      logApiRequest(convDir, requestBody, result);
+      const result: any = await response.json();
 
       const assistantMessage = result.choices[0]?.message;
       if (!assistantMessage) {
@@ -721,71 +750,47 @@ Only make the specific change requested above. The output should be identical to
       console.error(`[edit_image] Response has images: ${images ? 'yes (' + images.length + ')' : 'no'}`);
 
       if (images && Array.isArray(images) && images.length > 0) {
-        const assistantContent: Array<{ type: string; text?: string; image_path?: string }> = [];
+        const assistantContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
 
         if (textContent) {
           assistantContent.push({ type: "text", text: textContent });
         }
 
         for (const image of images) {
-          let imageUrl: string | null = null;
+          // Try multiple formats: OpenRouter, OpenAI, Gemini, etc.
+          let imageData: { buffer: Buffer; mimeType: string } | null = null;
 
-          if (image.imageUrl?.url) imageUrl = image.imageUrl.url;
-          else if (image.image_url?.url) imageUrl = image.image_url.url;
-          else if (image.url) imageUrl = image.url;
-          else if (image.data && typeof image.data === 'string') {
+          if (image.imageUrl?.url) {
+            imageData = await fetchImageAsBuffer(image.imageUrl.url);
+          } else if (image.image_url?.url) {
+            imageData = await fetchImageAsBuffer(image.image_url.url);
+          } else if (image.url) {
+            imageData = await fetchImageAsBuffer(image.url);
+          } else if (image.data && typeof image.data === 'string') {
             const mimeType = image.mimeType || image.mime_type || 'image/png';
-            imageUrl = `data:${mimeType};base64,${image.data}`;
+            imageData = { buffer: Buffer.from(image.data, 'base64'), mimeType };
+          } else if (image.b64_json) {
+            imageData = { buffer: Buffer.from(image.b64_json, 'base64'), mimeType: 'image/png' };
           }
-          else if (image.b64_json) {
-            imageUrl = `data:image/png;base64,${image.b64_json}`;
-          }
 
-          if (imageUrl) {
-            let savedFilepath: string | null = null;
+          if (imageData) {
+            const extension = imageData.mimeType.split("/")[1] || "png";
+            const filename = `${Date.now()}.${extension}`;
 
-            if (imageUrl.startsWith("data:")) {
-              const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
-              if (match) {
-                const mimeType = match[1];
-                const base64Data = match[2];
-                const extension = mimeType.split("/")[1] || "png";
-                const filename = `${Date.now()}.${extension}`;
-                savedFilepath = join(convDir, filename);
+            // Upload directly to S3
+            const s3Url = await uploadImageToS3(imageData.buffer, filename, imageData.mimeType, convId);
+            console.error(`Uploaded edited image to S3: ${s3Url} (${(imageData.buffer.length / 1024).toFixed(1)}KB)`);
 
-                const imageBuffer = Buffer.from(base64Data, "base64");
-                writeFileSync(savedFilepath, imageBuffer);
-                console.error(`Saved edited image: ${savedFilepath} (${(imageBuffer.length / 1024).toFixed(1)}KB)`);
-              }
-            } else {
-              try {
-                const fetchResp = await fetch(imageUrl);
-                const buffer = await fetchResp.arrayBuffer();
-                const contentType = fetchResp.headers.get("content-type") || "image/png";
-                const extension = contentType.split("/")[1] || "png";
-                const filename = `${Date.now()}.${extension}`;
-                savedFilepath = join(convDir, filename);
+            responseContent.push({
+              type: "text",
+              text: `IMAGE_URL: ${s3Url}`,
+            });
 
-                const imageBuffer = Buffer.from(buffer);
-                writeFileSync(savedFilepath, imageBuffer);
-                console.error(`Saved edited image: ${savedFilepath} (${(buffer.byteLength / 1024).toFixed(1)}KB)`);
-              } catch (fetchError) {
-                console.error(`Failed to fetch image: ${fetchError}`);
-              }
-            }
-
-            if (savedFilepath) {
-              responseContent.push({
-                type: "text",
-                text: `IMAGE_PATH: ${savedFilepath}`,
-              });
-
-              const relativePath = savedFilepath.replace(IMAGE_DIR + (process.platform === "win32" ? "\\" : "/"), "");
-              assistantContent.push({
-                type: "image_url",
-                image_path: relativePath,
-              } as any);
-            }
+            // Store S3 URL in conversation history
+            assistantContent.push({
+              type: "image_url",
+              image_url: { url: s3Url },
+            });
           }
         }
 
@@ -800,9 +805,9 @@ Only make the specific change requested above. The output should be identical to
         });
       }
 
-      // Save conversation
+      // Save conversation to memory and S3
       conversations.set(convId, messages);
-      saveConversationToDisk(convId, messages, getFirstPrompt(messages));
+      await saveConversationToS3(convId, messages);
 
       responseContent.push({
         type: "text",
@@ -833,143 +838,52 @@ server.tool(
   `Process a generated image. This tool MUST be called after generate_image or edit_image completes.
 
 Instructions for the assistant:
-1. Open the image using the system viewer so the user can see it
+1. Share the image URL with the user
 2. Ask the user if they would like to make any changes to the image
 3. If the user wants changes, use edit_image with the conversation_id to iterate`,
   {
-    image_path: z.string().describe("The full path to the generated image file"),
+    image_url: z.string().describe("The S3 image URL returned by generate_image or edit_image"),
     conversation_id: z.string().describe("The conversation ID for this image generation session"),
   },
-  async ({ image_path, conversation_id }) => {
-    if (!existsSync(image_path)) {
-      return {
-        content: [{ type: "text", text: `File not found: ${image_path}` }],
-        isError: true,
-      };
-    }
-
-    try {
-      // Open with default app based on platform
-      const { exec } = await import("child_process");
-      const command = process.platform === "win32"
-        ? `start "" "${image_path}"`
-        : process.platform === "darwin"
-        ? `open "${image_path}"`
-        : `xdg-open "${image_path}"`;
-
-      exec(command, (error) => {
-        if (error) {
-          console.error(`Failed to open image: ${error}`);
-        }
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Image opened: ${image_path}\n\nConversation ID: ${conversation_id}\n\nAsk the user if they'd like to make any changes to the image. If yes, use edit_image with this conversation_id to iterate.`,
-          },
-        ],
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `Failed to open image: ${e}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool: Show image (legacy, kept for backwards compatibility)
-server.tool(
-  "show_image",
-  "Open an image file with the default system image viewer.",
-  {
-    image_path: z.string().describe("The full path to the image file to display"),
-  },
-  async ({ image_path }) => {
-    if (!existsSync(image_path)) {
-      return {
-        content: [{ type: "text", text: `File not found: ${image_path}` }],
-        isError: true,
-      };
-    }
-
-    try {
-      // Open with default app based on platform
-      const { exec } = await import("child_process");
-      const command = process.platform === "win32"
-        ? `start "" "${image_path}"`
-        : process.platform === "darwin"
-        ? `open "${image_path}"`
-        : `xdg-open "${image_path}"`;
-
-      exec(command, (error) => {
-        if (error) {
-          console.error(`Failed to open image: ${error}`);
-        }
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Opened image: ${image_path}`,
-          },
-        ],
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `Failed to open image: ${e}` }],
-        isError: true,
-      };
-    }
+  async ({ image_url, conversation_id }) => {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Image available at: ${image_url}\n\nConversation ID: ${conversation_id}\n\nShare this URL with the user. Ask if they'd like to make any changes to the image. If yes, use edit_image with this conversation_id to iterate.`,
+        },
+      ],
+    };
   }
 );
 
 // Tool: List conversations
 server.tool(
   "list_conversations",
-  "List all image generation conversations (persisted to disk). Returns conversation IDs and descriptions.",
+  "List all image generation conversations (persisted to S3). Returns conversation IDs and descriptions.",
   {},
   async () => {
-    // Read from disk to get all conversations (including from previous sessions)
     const convList: string[] = [];
 
     try {
-      const dirs = readdirSync(IMAGE_DIR, { withFileTypes: true });
-      for (const dir of dirs) {
-        if (dir.isDirectory()) {
-          const convId = dir.name;
-          const readmePath = join(IMAGE_DIR, convId, "README.md");
-          const messagesPath = join(IMAGE_DIR, convId, "messages.json");
+      // Get all conversation IDs from in-memory cache (loaded from S3 on startup)
+      for (const [convId, messages] of conversations.entries()) {
+        const description = getFirstPrompt(messages).substring(0, 50);
+        const messageCount = messages.length;
 
-          let description = "No description";
-          let messageCount = 0;
-          let imageCount = 0;
-
-          // Read README for description
-          if (existsSync(readmePath)) {
-            const readme = readFileSync(readmePath, "utf-8");
-            const promptMatch = readme.match(/\*\*Initial Prompt:\*\* (.+)/);
-            if (promptMatch) {
-              description = promptMatch[1].substring(0, 50);
-              if (promptMatch[1].length > 50) description += "...";
+        // Count images in conversation
+        let imageCount = 0;
+        for (const msg of messages) {
+          if (Array.isArray(msg.content)) {
+            for (const item of msg.content) {
+              if (item.type === "image_url" && item.image_url?.url) {
+                imageCount++;
+              }
             }
           }
-
-          // Count messages
-          if (existsSync(messagesPath)) {
-            const messages = JSON.parse(readFileSync(messagesPath, "utf-8"));
-            messageCount = messages.length;
-          }
-
-          // Count images
-          const files = readdirSync(join(IMAGE_DIR, convId));
-          imageCount = files.filter(f => /\.(png|jpg|jpeg|gif|webp)$/i.test(f)).length;
-
-          convList.push(`- **${convId}**\n  "${description}" (${messageCount} messages, ${imageCount} images)`);
         }
+
+        convList.push(`- **${convId}**\n  "${description}${description.length >= 50 ? '...' : ''}" (${messageCount} messages, ${imageCount} images)`);
       }
     } catch (err) {
       console.error(`Error listing conversations: ${err}`);
@@ -991,7 +905,7 @@ server.tool(
 // Tool: Clear conversation
 server.tool(
   "clear_conversation",
-  "Clear a specific conversation or all conversations (removes from disk).",
+  "Clear a specific conversation or all conversations (removes from S3).",
   {
     conversation_id: z.string().optional().describe(
       "The conversation ID to clear. If not provided, clears all conversations."
@@ -1000,17 +914,19 @@ server.tool(
   async ({ conversation_id }) => {
     if (conversation_id) {
       // Remove from memory
+      const existed = conversations.has(conversation_id);
       conversations.delete(conversation_id);
 
-      // Remove from disk
-      const convDir = join(IMAGE_DIR, conversation_id);
-      if (existsSync(convDir)) {
-        rmSync(convDir, { recursive: true, force: true });
+      // Remove from S3
+      const prefix = `${s3Config.prefix}/${conversation_id}/`;
+      const deletedCount = await deleteS3Prefix(prefix);
+
+      if (existed || deletedCount > 0) {
         return {
           content: [
             {
               type: "text",
-              text: `Conversation ${conversation_id} cleared (removed from disk).`,
+              text: `Conversation ${conversation_id} cleared (removed ${deletedCount} objects from S3).`,
             },
           ],
         };
@@ -1029,23 +945,15 @@ server.tool(
       const count = conversations.size;
       conversations.clear();
 
-      // Remove all conversation directories
-      let diskCount = 0;
-      try {
-        const dirs = readdirSync(IMAGE_DIR, { withFileTypes: true });
-        for (const dir of dirs) {
-          if (dir.isDirectory()) {
-            rmSync(join(IMAGE_DIR, dir.name), { recursive: true, force: true });
-            diskCount++;
-          }
-        }
-      } catch {}
+      // Remove all from S3
+      const prefix = `${s3Config.prefix}/`;
+      const deletedCount = await deleteS3Prefix(prefix);
 
       return {
         content: [
           {
             type: "text",
-            text: `Cleared ${Math.max(count, diskCount)} conversation(s) from memory and disk.`,
+            text: `Cleared ${count} conversation(s) from memory (${deletedCount} objects from S3).`,
           },
         ],
       };
@@ -1055,8 +963,8 @@ server.tool(
 
 // Start server
 async function main() {
-  // Load existing conversations from disk
-  loadConversationsFromDisk();
+  // Load existing conversations from S3
+  await loadConversationsFromS3();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

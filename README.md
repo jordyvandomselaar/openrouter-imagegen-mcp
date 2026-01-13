@@ -6,6 +6,7 @@ An MCP (Model Context Protocol) server for AI image generation and editing using
 
 - **Generate images** from text prompts using Gemini Flash Image Preview
 - **Edit existing images** with natural language instructions (e.g., "make the sky orange")
+- **S3 image hosting** - upload images to S3-compatible storage (MinIO, Cloudflare R2, etc.) and return public URLs
 - **Conversation persistence** - pick up where you left off with saved conversation history
 - **Automatic image saving** - all generated images saved to disk with metadata
 - **API request logging** - debug logs saved to conversation folders
@@ -83,6 +84,48 @@ If running Bun through WSL:
   }
 }
 ```
+
+## S3 Image Hosting (Optional)
+
+For server deployments (e.g., Coolify, Docker), you can configure S3-compatible storage to host images and return public URLs instead of local file paths.
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `S3_ENDPOINT` | Yes | S3-compatible endpoint URL (e.g., `https://minio.example.com`) |
+| `S3_BUCKET` | Yes | Bucket name for storing images |
+| `S3_ACCESS_KEY_ID` | Yes | S3 access key ID |
+| `S3_SECRET_ACCESS_KEY` | Yes | S3 secret access key |
+| `S3_PUBLIC_URL_BASE` | Yes | Public URL base for accessing images (e.g., `https://cdn.example.com/bucket`) |
+| `S3_REGION` | No | S3 region (default: `auto`) |
+| `S3_PREFIX` | No | Path prefix for uploaded images (default: `images`) |
+
+### Example: Coolify with MinIO
+
+```bash
+# In your Coolify environment variables:
+OPENROUTER_API_KEY=sk-or-...
+S3_ENDPOINT=https://minio.yourdomain.com
+S3_BUCKET=imagegen
+S3_ACCESS_KEY_ID=your-access-key
+S3_SECRET_ACCESS_KEY=your-secret-key
+S3_PUBLIC_URL_BASE=https://minio.yourdomain.com/imagegen
+S3_REGION=auto
+S3_PREFIX=generated
+```
+
+### Example: Cloudflare R2
+
+```bash
+S3_ENDPOINT=https://your-account-id.r2.cloudflarestorage.com
+S3_BUCKET=imagegen
+S3_ACCESS_KEY_ID=your-r2-access-key
+S3_SECRET_ACCESS_KEY=your-r2-secret-key
+S3_PUBLIC_URL_BASE=https://your-r2-public-url.com
+```
+
+When S3 is configured, generated images will be uploaded and the tool will return `IMAGE_URL: https://...` instead of `IMAGE_PATH: /local/path/...`.
 
 ## Usage
 
